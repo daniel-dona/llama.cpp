@@ -1,0 +1,29 @@
+# CPU-only llama-server including the local patches (echo prompt-logprobs +
+# GET /tokenizer_info), branch feat/echo-prompt-logprobs.
+#
+# Build context must be the repository root. The runtime image carries the
+# llama-server binary plus the shared libraries it links against; the model
+# is expected to be volume-mounted, not baked in.
+
+FROM ubuntu:24.04 AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        g++ cmake ninja-build python3 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B build -G Ninja \
+        -DGGML_NATIVE=ON \
+        -DLLAMA_CURL=OFF \
+        -DLLAMA_BUILD_TESTS=OFF \
+        -DLLAMA_BUILD_EXAMPLES=OFF \
+        -DLLAMA_SERVER_WEBUI=OFF \
+    && cmake --build build --target llama-server -j"$(nproc)"
+
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY --from=build /src/build/bin/ /app/bin/
+ENV LD_LIBRARY_PATH=/app/bin
+EXPOSE 8491
+ENTRYPOINT ["/app/bin/llama-server"]
