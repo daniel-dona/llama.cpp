@@ -47,6 +47,12 @@ static common_speculative_output_limits server_output_limits(const common_params
     auto result = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
 
+    // echo (prompt logprobs) requests logits at every prompt position, which means up to
+    // a full ubatch of outputs in a single decode: make sure the output buffers can hold it
+    const int32_t n_ubatch_outputs = std::min<int32_t>(params.n_ubatch, params.n_batch);
+    result.total   = std::max<int32_t>(result.total,   n_ubatch_outputs);
+    result.per_seq = std::max<int32_t>(result.per_seq, n_ubatch_outputs);
+
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
@@ -283,6 +289,14 @@ struct server_slot {
 
     std::vector<completion_token_output> generated_token_probs;
 
+    // echo: logprobs of prompt tokens 1..n-1, captured during prompt processing
+    // (send_final_response prepends a placeholder entry for position 0, which has no logprob)
+    std::vector<completion_token_output> prompt_token_probs;
+
+    // echo: prompt batch entries awaiting logprob capture (batch index, prompt position),
+    // in ascending batch order; entries are consumed by post_decode as sub-batches decode
+    std::vector<std::pair<int32_t, int32_t>> i_batch_prompt;
+
     bool has_next_token = true;
     bool has_new_line   = false;
     bool truncated      = false;
@@ -386,6 +400,8 @@ struct server_slot {
         }
         generated_tokens.clear();
         generated_token_probs.clear();
+        prompt_token_probs.clear();
+        i_batch_prompt.clear();
         json_schema = json();
 
         task_prev = std::move(task);
@@ -468,7 +484,9 @@ struct server_slot {
     }
 
     bool can_speculate() const {
-        return !!spec;
+        // speculative decoding replays prompt tokens without producing logits for them,
+        // which is incompatible with echo (prompt-token logprobs)
+        return !!spec && task && !task->params.need_prompt_logits();
     }
 
     void add_token(const completion_token_output & token) {
@@ -1787,7 +1805,8 @@ private:
                 return false;
             }
 
-            const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
+            const bool need_pre_sample_logits = task.params.need_prompt_logits() ||
+                (task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs);
 
             bool use_backend_sampling = task.params.sampling.backend_sampling;
 
@@ -2120,6 +2139,20 @@ private:
         res->stopping_word         = slot.stopping_word;
         res->stop                  = slot.stop;
         res->post_sampling_probs   = slot.task->params.post_sampling_probs;
+        res->echo                  = slot.task->params.echo;
+
+        // echo: hand over the prompt-token logprobs captured during prompt processing
+        res->prompt_probs_output = std::move(slot.prompt_token_probs);
+        if (res->echo && slot.task->n_tokens() > 0) {
+            // prepend a placeholder for prompt position 0: it has no logprob (there is no
+            // preceding context). the serializer emits null for the first entry, which keeps
+            // the arrays aligned with the OpenAI contract of length n_prompt + n_generated
+            completion_token_output first_entry;
+            first_entry.tok          = slot.task->tokens[0];
+            first_entry.text_to_send = common_token_to_piece(slot.ctx_tgt, first_entry.tok, params_base.special);
+            first_entry.prob         = 0.0f; // unused: the serializer emits null for the first entry
+            res->prompt_probs_output.insert(res->prompt_probs_output.begin(), std::move(first_entry));
+        }
 
         res->verbose           = slot.task->params.verbose;
         res->stream            = slot.task->params.stream;
@@ -2867,8 +2900,20 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+
+        // echo tasks need logits at every prompt position, and llama_decode reserves its output
+        // buffer (n_outputs * n_vocab floats) for the whole llama_decode() call: cap the view
+        // size at n_ubatch while an echo task is in flight to keep that buffer bounded
+        bool batch_has_echo = false;
+        iterate(slots, [&](server_slot & slot) {
+            if (slot.is_processing() && slot.task->params.need_prompt_logits()) {
+                batch_has_echo = true;
+            }
+        });
+        const int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            const int32_t n_tokens = std::min(batch_has_echo ? std::min(n_batch, n_ubatch) : n_batch, batch.size() - off);
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -3214,7 +3259,10 @@ private:
                                 return;
                             }
 
-                            if (slot.task->params.cache_prompt) {
+                            // echo needs logits at every prompt position, which the KV cache cannot
+                            // provide: force a full re-processing of the prompt (slot-local, unlike
+                            // the global llama_memory_clear used by the old echo prototype)
+                            if (slot.task->params.cache_prompt && !slot.task->params.need_prompt_logits()) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
 
@@ -3462,6 +3510,10 @@ private:
                     // make checkpoints only for completion tasks
                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
 
+                    // echo: restoring a checkpoint mid-prompt would skip the re-evaluation of some
+                    // positions, silently dropping their logprobs - disable checkpoints for those tasks
+                    do_checkpoint = do_checkpoint && !slot.task->params.need_prompt_logits();
+
                     // make a checkpoint of the parts of the memory that cannot be rolled back.
                     // checkpoints are created only if:
                     // - the model does not support partial sequence removal
@@ -3536,15 +3588,25 @@ private:
                             break;
                         }
 
+                        // echo: request logits at every prompt position, not only at the last one
+                        const bool need_prompt_logits = slot.task->params.need_prompt_logits();
+                        // index of cur_tok within the task prompt (used to pair the entry logits
+                        // with the following token when capturing the echo logprobs)
+                        const int cur_tok_idx = slot.prompt.n_tokens();
+
                         // embedding requires all tokens in the batch to be output;
                         // MTP also wants logits at every prompt position so the
                         // streaming hook can mirror t_h_nextn into ctx_dft.
                         add_ok &= batch.add(slot.id,
                             cur_tok,
                             /* pos       = */ slot.prompt.tokens.pos_next(),
-                            /* output    = */ slot.need_embd(),
+                            /* output    = */ slot.need_embd() || need_prompt_logits,
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
+
+                        if (need_prompt_logits) {
+                            slot.i_batch_prompt.push_back({batch.size() - 1, cur_tok_idx});
+                        }
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3807,6 +3869,63 @@ private:
             if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
                 if (slot.task->params.stream && slot.task->params.return_progress) {
                     send_partial_response(slot, {}, true);
+                }
+            }
+
+            // echo: capture the logprobs of the prompt tokens decoded in this sub-batch.
+            // the logits at batch entry i hold the distribution of the token that FOLLOWS the
+            // token at entry i, so the logprob of prompt token p + 1 is read from the entry of
+            // prompt token p (the token at position 0 has no preceding logits -> null in the output)
+            if ((slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT)
+                    && slot.task->params.need_prompt_logits()
+                    && !slot.i_batch_prompt.empty()) {
+                size_t n_captured = 0;
+                for (const auto & entry : slot.i_batch_prompt) {
+                    if (!is_inside_view(entry.first)) {
+                        // entries are sorted by batch index: nothing else can be in this view
+                        break;
+                    }
+                    n_captured++;
+
+                    if (entry.second + 1 >= slot.task->n_tokens()) {
+                        // last prompt entry: its logits are consumed by the sampler below
+                        continue;
+                    }
+
+                    const llama_token tok_next = slot.task->tokens[entry.second + 1];
+                    if (tok_next == LLAMA_TOKEN_NULL) {
+                        continue; // multimodal placeholder, echo is rejected for mtmd requests
+                    }
+
+                    completion_token_output out;
+                    out.tok          = tok_next;
+                    out.text_to_send = common_token_to_piece(slot.ctx_tgt, tok_next, params_base.special);
+                    out.prob         = 1.0f;
+
+                    const std::vector<llama_token_data> cur = get_token_probabilities(slot.ctx_tgt, entry.first - off,
+                            slot.task->params.sampling.n_probs);
+
+                    // probability of the actual prompt token (may be outside of the top-n_probs)
+                    for (const auto & t : cur) {
+                        if (t.id == tok_next) {
+                            out.prob = t.p;
+                            break;
+                        }
+                    }
+
+                    // top-n_probs candidates for the top_logprobs field
+                    for (size_t i = 0; i < cur.size() && i < (size_t) slot.task->params.sampling.n_probs; i++) {
+                        out.probs.push_back({
+                            cur[i].id,
+                            common_token_to_piece(slot.ctx_tgt, cur[i].id, params_base.special),
+                            cur[i].p
+                        });
+                    }
+
+                    slot.prompt_token_probs.push_back(std::move(out));
+                }
+                if (n_captured > 0) {
+                    slot.i_batch_prompt.erase(slot.i_batch_prompt.begin(), slot.i_batch_prompt.begin() + n_captured);
                 }
             }
 
@@ -4327,6 +4446,22 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.params.res_type          = res_type;
             task.params.oaicompat_cmpl_id = completion_id;
             task.params.oaicompat_model   = meta->model_name;
+
+            // OAI-compat: support "echo" (prompt logprobs) on /v1/completions
+            if (res_type == TASK_RESPONSE_TYPE_OAI_CMPL) {
+                task.params.echo = json_value(data, "echo", false);
+                if (task.params.echo) {
+                    if (task.params.sampling.n_probs <= 0) {
+                        throw std::runtime_error("echo requires logprobs > 0");
+                    }
+                    if (task.params.stream) {
+                        throw std::runtime_error("echo with logprobs is not supported with stream=true (not yet implemented)");
+                    }
+                    if (ctx_server.mctx != nullptr) {
+                        throw std::runtime_error("echo is not supported with multimodal input");
+                    }
+                }
+            }
 
             // prepare child tasks
             if (task.params.n_cmpl > 1) {

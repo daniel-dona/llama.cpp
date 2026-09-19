@@ -126,6 +126,7 @@ json task_params::to_json(bool only_metrics) const {
         {"ignore_eos",                sampling.ignore_eos},
         {"stream",                    stream},
         {"logit_bias",                format_logit_bias(sampling.logit_bias)},
+        {"echo",                      echo},
         {"n_probs",                   sampling.n_probs},
         {"min_keep",                  sampling.min_keep},
         {"grammar",                   common_grammar_value(sampling.grammar)},
@@ -306,6 +307,56 @@ float completion_token_output::logarithm(float x) {
     return x == 0.0f ? std::numeric_limits<float>::lowest() : std::log(x);
 }
 
+// legacy OpenAI logprobs format, used by the echo response of /v1/completions:
+//   {"text_offset": [...], "token_logprobs": [...], "tokens": [...], "top_logprobs": [...]}
+// the logprob (and top_logprobs) of the first prompt token is null (OpenAI contract,
+// there is no preceding context to score it against)
+static json echo_logprobs_to_legacy_json(
+        const std::vector<completion_token_output> & prompt_probs,
+        const std::vector<completion_token_output> & gen_probs) {
+    json text_offset    = json::array();
+    json token_logprobs = json::array();
+    json tokens         = json::array();
+    json top_logprobs   = json::array();
+
+    int  offset = 0;
+    bool first  = true;
+
+    auto add_entries = [&](const std::vector<completion_token_output> & probs) {
+        for (const auto & p : probs) {
+            std::string txt(p.text_to_send);
+            txt.resize(validate_utf8(txt));
+            text_offset.push_back(offset);
+            offset += (int) txt.size();
+            tokens.push_back(txt);
+            if (first) {
+                token_logprobs.push_back(nullptr);
+                top_logprobs.push_back(nullptr);
+                first = false;
+                continue;
+            }
+            token_logprobs.push_back(completion_token_output::logarithm(p.prob));
+            json top = json::object();
+            for (const auto & q : p.probs) {
+                std::string qtxt(q.txt);
+                qtxt.resize(validate_utf8(qtxt));
+                top[qtxt] = completion_token_output::logarithm(q.prob);
+            }
+            top_logprobs.push_back(top);
+        }
+    };
+
+    add_entries(prompt_probs);
+    add_entries(gen_probs);
+
+    return json {
+        {"text_offset",    text_offset},
+        {"token_logprobs", token_logprobs},
+        {"tokens",         tokens},
+        {"top_logprobs",   top_logprobs},
+    };
+}
+
 std::vector<unsigned char> completion_token_output::str_to_bytes(const std::string & str) {
     std::vector<unsigned char> bytes;
     for (unsigned char c : str) {
@@ -374,7 +425,11 @@ json server_task_result_cmpl_final::usage_json_oaicompat() {
 json server_task_result_cmpl_final::to_json_oaicompat() {
     std::time_t t = std::time(0);
     json logprobs = json(nullptr); // OAI default to null
-    if (!stream && probs_output.size() > 0) {
+    if (!stream && echo && (prompt_probs_output.size() > 0 || probs_output.size() > 0)) {
+        // echo: legacy logprobs format covering prompt + generated tokens
+        // (required by clients such as lm-evaluation-harness)
+        logprobs = echo_logprobs_to_legacy_json(prompt_probs_output, probs_output);
+    } else if (!stream && probs_output.size() > 0) {
         logprobs = json{
             {"content", completion_token_output::probs_vector_to_json(probs_output, post_sampling_probs)},
         };
@@ -386,7 +441,7 @@ json server_task_result_cmpl_final::to_json_oaicompat() {
     json res = json {
         {"choices",            json::array({
             json{
-                {"text",          content},
+                {"text",          echo ? prompt + content : content},
                 {"index",         index},
                 {"logprobs",      logprobs},
                 {"finish_reason", finish_reason},

@@ -1047,10 +1047,8 @@ json oaicompat_completion_params_parse(const json & body) {
         llama_params["stop"] = json_value(body, "stop", json::array());
     }
 
-    // Handle "echo" field
-    if (json_value(body, "echo", false)) {
-        throw std::runtime_error("Only no echo is supported");
-    }
+    // note: the "echo" field is kept in llama_params and validated later by
+    // handle_completions_impl (see TASK_RESPONSE_TYPE_OAI_CMPL)
 
     // Params supported by OAI but unsupported by llama.cpp
     static const std::vector<std::string> unsupported_params { "best_of", "suffix" };

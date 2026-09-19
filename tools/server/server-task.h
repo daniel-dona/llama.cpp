@@ -75,6 +75,17 @@ struct task_params {
     bool timings_per_token   = false;
     bool post_sampling_probs = false;
 
+    // OpenAI-style "echo": return the logprobs of the prompt tokens in the response
+    // (legacy logprobs format). Requires n_probs > 0 and is only used by the
+    // /v1/completions endpoint (non-streaming).
+    bool echo = false;
+
+    // echo requires logits at every prompt position, which in turn requires re-processing
+    // the whole prompt (no KV cache reuse) and keeping the pre-sampling logits around
+    bool need_prompt_logits() const {
+        return echo && sampling.n_probs > 0;
+    }
+
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
 
@@ -337,6 +348,12 @@ struct server_task_result_cmpl_final : server_task_result {
 
     bool post_sampling_probs;
     std::vector<completion_token_output> probs_output;
+
+    // echo (non-streaming): logprobs of prompt tokens 1..n-1 (the first token has no
+    // logprob by contract and is emitted as null during serialization)
+    bool echo = false;
+    std::vector<completion_token_output> prompt_probs_output;
+
     std::vector<std::string>  response_fields;
 
     task_params generation_params;

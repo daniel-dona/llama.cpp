@@ -1305,6 +1305,36 @@ completion = client.completions.create(
 print(completion.choices[0].text)
 ```
 
+#### `echo`: prompt logprobs
+
+The `echo` option is supported on this endpoint (non-streaming only, requires `logprobs > 0`).
+When set, the response contains the logprobs of **all** prompt tokens plus the generated ones,
+serialized in the **legacy** OpenAI logprobs format (this is what tools such as
+[lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness) expect):
+
+```json
+{
+  "choices": [{
+    "text": "<prompt><completion>",
+    "logprobs": {
+      "text_offset":    [0, 3, 8, ...],
+      "token_logprobs": [null, -8.818, -1.552, ...],
+      "tokens":         ["The", " step", " of", ...],
+      "top_logprobs":   [null, {" step": -8.818, ...}, ...]
+    }
+  }]
+}
+```
+
+Notes:
+
+- `token_logprobs[0]` and `top_logprobs[0]` are `null`: there is no preceding context to score the
+  first prompt token against (OpenAI contract).
+- `echo: true` with `stream: true` or without `logprobs` returns `400`.
+- Prompt processing always re-evaluates the whole prompt (the KV cache cannot produce logits for
+  cached positions), so the response also reports `cached_tokens = 0`.
+- Logprobs are computed before the sampling chain (i.e. they reflect the raw model distribution).
+
 ### POST `/v1/chat/completions`: OpenAI-compatible Chat Completions API
 
 Given a ChatML-formatted json description in `messages`, it returns the predicted completion. Both synchronous and streaming mode are supported, so scripted and interactive applications work fine. While no strong claims of compatibility with OpenAI API spec is being made, in our experience it suffices to support many apps. Only models with a [supported chat template](https://github.com/ggml-org/llama.cpp/wiki/Templates-supported-by-llama_chat_apply_template) can be used optimally with this endpoint. By default, the ChatML template will be used.
