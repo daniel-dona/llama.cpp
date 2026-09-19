@@ -34,6 +34,10 @@ struct server_context_meta {
     // tokens
     std::string bos_token_str;
     std::string eos_token_str;
+    std::string pad_token_str;
+    std::string eot_token_str;
+    bool add_bos_token;
+    bool add_eos_token;
     llama_token fim_pre_token;
     llama_token fim_sub_token;
     llama_token fim_mid_token;
@@ -133,6 +137,7 @@ struct server_routes {
     server_http_context::handler_t get_slots;
     server_http_context::handler_t post_slots;
     server_http_context::handler_t get_props;
+    server_http_context::handler_t get_tokenizer_info;
     server_http_context::handler_t post_props;
     server_http_context::handler_t post_infill;
     server_http_context::handler_t post_completions;

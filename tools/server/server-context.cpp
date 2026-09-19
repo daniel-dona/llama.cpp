@@ -4302,6 +4302,10 @@ server_context_meta server_context::get_meta() const {
     auto eos_id = llama_vocab_eos(impl->vocab);
     auto bos_token_str = bos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, bos_id, true) : "";
     auto eos_token_str = eos_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, eos_id, true) : "";
+    auto pad_id = llama_vocab_pad(impl->vocab);
+    auto eot_id = llama_vocab_eot(impl->vocab);
+    auto pad_token_str = pad_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, pad_id, true) : "";
+    auto eot_token_str = eot_id != LLAMA_TOKEN_NULL ? common_token_to_piece(impl->ctx_tgt, eot_id, true) : "";
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
 
@@ -4324,6 +4328,10 @@ server_context_meta server_context::get_meta() const {
 
         /* bos_token_str          */ bos_token_str,
         /* eos_token_str          */ eos_token_str,
+        /* pad_token_str          */ pad_token_str,
+        /* eot_token_str          */ eot_token_str,
+        /* add_bos_token          */ llama_vocab_get_add_bos(impl->vocab),
+        /* add_eos_token          */ llama_vocab_get_add_eos(impl->vocab),
         /* fim_pre_token          */ llama_vocab_fim_pre(impl->vocab),
         /* fim_sub_token          */ llama_vocab_fim_suf(impl->vocab),
         /* fim_mid_token          */ llama_vocab_fim_mid(impl->vocab),
@@ -4945,6 +4953,27 @@ void server_routes::init_routes() {
         } else {
             res->ok(get_res_props(*meta, params, false));
         }
+        return res;
+    };
+
+    // OpenAI/vLLM-style tokenizer info, consumed e.g. by lm-evaluation-harness
+    // (tokenizer_backend=remote). tokens are returned as strings (null when absent,
+    // never ""); token ids are resolved by the client through POST /tokenize.
+    // reads only the meta snapshot: accessible during sleep, like get_props
+    this->get_tokenizer_info = [this](const server_http_req &) {
+        auto res = create_response(true);
+        std::string tmpl = common_chat_templates_source(meta->chat_params.tmpls.get(), "");
+        res->ok(json {
+            { "model_path",    meta->model_path },
+            { "eos_token",     meta->eos_token_str.empty() ? json(nullptr) : json(meta->eos_token_str) },
+            { "bos_token",     meta->bos_token_str.empty() ? json(nullptr) : json(meta->bos_token_str) },
+            { "pad_token",     meta->pad_token_str.empty() ? json(nullptr) : json(meta->pad_token_str) },
+            { "eot_token",     meta->eot_token_str.empty() ? json(nullptr) : json(meta->eot_token_str) },
+            { "add_bos_token", meta->add_bos_token },
+            { "add_eos_token", meta->add_eos_token },
+            { "n_vocab",       meta->model_vocab_n_tokens },
+            { "chat_template", tmpl.empty() ? json(nullptr) : json(tmpl) },
+        });
         return res;
     };
 
